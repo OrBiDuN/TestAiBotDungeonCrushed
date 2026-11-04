@@ -1,0 +1,10 @@
+PySide6-Essentials==6.8.3
+mss==10.2.0
+windows-capture==2.0.1
+psutil==7.2.2
+winrt-Windows.Media.Ocr==4!10.0.28000.2705
+winrt-Windows.Graphics.Imaging==4!10.0.28000.2705
+winrt-Windows.Globalization==4!10.0.28000.2705
+winrt-Windows.Storage.Streams==4!10.0.28000.2705
+winrt-Windows.Foundation==4!10.0.28000.2705
+winrt-Windows.Foundation.Collections==4!10.0.28000.2705

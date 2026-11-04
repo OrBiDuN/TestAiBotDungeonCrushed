@@ -1,0 +1,17 @@
+{
+  "cases": [
+    {
+      "initially_minimized": true,
+      "restored": true,
+      "foreground_matches": true
+    },
+    {
+      "initially_minimized": false,
+      "restored": true,
+      "foreground_matches": true
+    }
+  ],
+  "success": true,
+  "error": null,
+  "stop_cancels_wake": true
+}

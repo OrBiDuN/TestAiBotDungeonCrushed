@@ -1,0 +1,56 @@
+[
+  {
+    "file": "codex-clipboard-5192f376-f4ef-432e-87c2-79f4b594f58b.png",
+    "sha256": "3f0dfc42ce85182e2d0f83315be761eeed9c21783de27a1d9cca3e68d5befb6c",
+    "bytes": 1756241,
+    "source": "User-provided screenshot; static test fixture only"
+  },
+  {
+    "file": "codex-clipboard-d1dc1914-9b7a-40d8-9fe6-2d1031f36e38.png",
+    "sha256": "8e7d4ae7fe500e70b50235e61113e9cc71264c2a2dc4fe7142f4510e2a6c3823",
+    "bytes": 1813138,
+    "source": "User-provided screenshot; static test fixture only"
+  },
+  {
+    "file": "codex-clipboard-6e25461f-b59f-4819-9b7d-3633aebbe189.png",
+    "sha256": "6961a64a90f69e71f4f86bfff0fa08b0256d552e9f6742d5cb2377e6085c394f",
+    "bytes": 1353374,
+    "source": "User-provided screenshot; static test fixture only"
+  },
+  {
+    "file": "codex-clipboard-93b97a85-93dd-4786-8666-41d1f0826c80.png",
+    "sha256": "77fcb2fc9dea06f48e9696e32116e9172ae94d4e84dd2c9d796b41abc24ca213",
+    "bytes": 1730800,
+    "source": "User-provided screenshot; static test fixture only"
+  },
+  {
+    "file": "codex-clipboard-e5b8ab82-6750-4e13-9233-60d2932aa0b8.png",
+    "sha256": "d24fd43230d1ff00dbf04c3825b36dbd6e35fd80ab6857199a9002c9be01b456",
+    "bytes": 1580304,
+    "source": "User-provided screenshot; static test fixture only"
+  },
+  {
+    "file": "codex-clipboard-e6054eaf-6dc6-4750-b541-3c29ec305967.png",
+    "sha256": "34f7cce110192dac85851c7594943af3a81a3089085c2ef8e6c85bc2bc0f0994",
+    "bytes": 570876,
+    "source": "User-provided screenshot; static test fixture only"
+  },
+  {
+    "file": "codex-clipboard-dc4ac507-5722-4322-83c6-a61820fe1fbe.png",
+    "sha256": "64e7e43b31a2b4b1a01c7f5813e677686ccbc293d9639a8552fc9cf17ec6f81f",
+    "bytes": 569330,
+    "source": "User-provided screenshot; static test fixture only"
+  },
+  {
+    "file": "codex-clipboard-fd8f757d-abd5-4ad1-8dec-d253b487dde9.png",
+    "sha256": "4dd833b578398998d4fe03944bf63b2140f460321c5232a9986b8782f50582a6",
+    "bytes": 2494010,
+    "source": "User-provided screenshot; static test fixture only"
+  },
+  {
+    "file": "codex-clipboard-b310d67e-2c9b-4f07-93fb-d89a367c036a.png",
+    "sha256": "4f865c129a6ac7bbffebe92c6c9be9d8a69bc3c9e7c8c76c825eaf9533f2e634",
+    "bytes": 585098,
+    "source": "User-provided screenshot; static test fixture only"
+  }
+]

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+screenshots/
+*.log
+selfcheck-result.json
+live-benchmark.json
+steam-capture-result.json
+live-preview.png
+steam-live-preview.png
+data/
