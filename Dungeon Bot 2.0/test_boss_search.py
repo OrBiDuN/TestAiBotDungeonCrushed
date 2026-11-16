@@ -1,10 +1,14 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from PySide6.QtWidgets import QApplication
 from launcher import Launcher
 from bosssearch import BossSearch, SceneDetector
 from build_siege_assets import read_reference
+import cv2
+import numpy as np
+from siege import ButtonMatcher
 
 class SearchTests(unittest.TestCase):
     @classmethod
@@ -18,6 +22,15 @@ class SearchTests(unittest.TestCase):
         results = [detector.inspect(read_reference(i)) for i in range(5)]
         self.assertEqual([r['scene'] for r in results], expected)
         self.assertGreater(results[3]['track']['point'][1], results[2]['track']['point'][1])
+
+    def test_new_battle_map_uses_exit_cross_even_when_turn_template_changes(self):
+        path = Path(__file__).parent/'tests'/'fixtures'/'codex-clipboard-d828fd17-0e0c-40d9-9101-db043934011e.png'
+        image=cv2.imdecode(np.fromfile(path,np.uint8),cv2.IMREAD_COLOR)
+        matcher=ButtonMatcher()
+        self.assertIsNotNone(matcher.find(image,'battle_close'))
+        self.assertIsNone(matcher.find(image,'battle_turn'))
+        self.assertIsNotNone(matcher.battle_ready(image))
+        self.assertEqual(SceneDetector().inspect(image)['scene'],'Бой — крестик найден')
 
     def test_search_retargets_then_stops_when_absent(self):
         ui = Launcher()

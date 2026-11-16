@@ -21,6 +21,7 @@ class BossAttack(SiegeRoute):
             if win.user32.GetAsyncKeyState(0x1B)&0x8000:
                 ui.stop();return
             now=time.monotonic()
+            if self.wait_for_video():return
             if self.phase=='wake':
                 if not self.wake.poll(): return
                 frame=ui.latest_video_frame()

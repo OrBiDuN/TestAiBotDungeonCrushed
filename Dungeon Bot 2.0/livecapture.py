@@ -9,6 +9,7 @@ from collections import deque
 from PySide6.QtCore import QThread
 from PySide6.QtGui import QImage
 import winmouse as win
+from runtime_log import logger
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,8 @@ class LiveCapture(QThread):
         self._state = 'Запуск WGC…'
         self._error = None
         self._last_publish = 0.0
+        self._recoveries = 0
+        self._session_closed = threading.Event()
         self._times = deque(maxlen=60)  # Timestamps only, never a frame queue.
 
     def request_stop(self):
@@ -61,6 +64,7 @@ class LiveCapture(QThread):
                         state=self._state, error=self._error, last=self._last)
 
     def fail(self, exc):
+        logger.error('WGC hwnd=%s: %s', self.hwnd, exc)
         with self._lock:
             self._error = str(exc)
             self._state = 'Ошибка: ' + str(exc)
@@ -140,56 +144,109 @@ class LiveCapture(QThread):
             self.fail(exc)
             internal.stop()
 
+    def clear_session_frame(self):
+        with self._lock:
+            self._frame = None
+            self._times.clear()
+            self._last = self._last_publish = 0.0
+
     def run(self):
         control = capture = None
+        failures = 0
+
+        def stop_capture():
+            nonlocal control, capture
+            # Keep valid callbacks until the native thread has joined. The wrapper
+            # raises if a callback is None while a final frame is being delivered.
+            if capture is not None:
+                capture.frame_handler = lambda frame, internal: internal.stop()
+                capture.closed_handler = lambda: None
+            if control is not None:
+                control.stop()
+            control = capture = None
+
         try:
             from windows_capture import WindowsCapture
-            while win.user32.IsIconic(self.hwnd) and not self._stop.is_set():
-                with self._lock:
-                    self._state = 'Пауза: выбранное окно свёрнуто. Ожидание разворачивания.'
-                self._stop.wait(0.1)
-            if self._stop.is_set():
-                return
-            self.validate()
-            # MinimumUpdateInterval is absent on some supported Windows builds.
-            # Throttle before copying in receive(), keeping WGC itself compatible.
-            capture = WindowsCapture(window_hwnd=self.hwnd, cursor_capture=False)
-            capture.frame_handler = self.receive
-            capture.closed_handler = lambda: self.fail(RuntimeError('WGC: целевое окно закрыто.'))
-            control = capture.start_free_threaded()
-            started = time.perf_counter()
-            while not self._stop.wait(0.1):
+            logger.info('WGC start hwnd=%s fps=%s', self.hwnd, self.target_fps)
+            while not self._stop.is_set():
                 if win.identity(self.hwnd) != self.owner:
                     raise RuntimeError('Выбранное окно закрыто или заменено.')
                 if win.user32.IsIconic(self.hwnd):
+                    self.clear_session_frame()
                     with self._lock:
-                        self._frame = None
-                        self._times.clear()
-                        self._state = 'Пауза: окно свёрнуто. Поток продолжится после разворачивания.'
-                    started = time.perf_counter()  # No first-frame timeout while minimized.
+                        self._state = 'Пауза: окно свёрнуто. Ожидаю разворачивания.'
+                    if self._stop.wait(.1):
+                        break
                     continue
-                self.validate()
-                if control.is_finished():
-                    control.wait()  # Propagate callback/native failures.
-                    raise RuntimeError('Сеанс WGC завершился неожиданно.')
-                snap = self.snapshot()
-                if snap['count'] == 0 and time.perf_counter()-started > 8:
-                    raise RuntimeError('WGC не передал ни одного кадра за 8 секунд. '
-                                       'Возможны запрет захвата окна, свёрнутое окно или недоступный графический сеанс.')
-                if snap['last'] and time.perf_counter()-snap['last'] > 2:
+                self.validate()  # Invalid geometry/identity is not a transport fault.
+                self.clear_session_frame()
+                self._session_closed.clear()
+                reason = None
+                try:
+                    capture = WindowsCapture(window_hwnd=self.hwnd, cursor_capture=False)
+                    capture.frame_handler = self.receive
+                    capture.closed_handler = self._session_closed.set
+                    control = capture.start_free_threaded()
+                    started = time.perf_counter()
+                    healthy_since = None
                     with self._lock:
-                        self._state = 'Нет новых кадров WGC более 2 с (статичное/недоступное окно)'
+                        self._state = 'Ожидаю первый кадр WGC…'
+                    while not self._stop.wait(.1):
+                        if win.identity(self.hwnd) != self.owner:
+                            self.fail(RuntimeError('Выбранное окно закрыто или заменено.'))
+                            break
+                        if win.user32.IsIconic(self.hwnd):
+                            break  # Recreate the surface after restore.
+                        try:
+                            self.validate()
+                        except Exception as exc:
+                            self.fail(exc)
+                            break
+                        if control.is_finished():
+                            control.wait()
+                            raise RuntimeError('Сеанс WGC завершился неожиданно.')
+                        if self._session_closed.is_set():
+                            raise RuntimeError('WGC сообщил о закрытии поверхности захвата.')
+                        snap = self.snapshot()
+                        now = time.perf_counter()
+                        # Count is lifetime-monotonic for vision consumers; first
+                        # frame timeout must instead use this session's timestamp.
+                        if not snap['last'] and now-started > 8:
+                            raise RuntimeError('Нет первого кадра WGC за 8 секунд.')
+                        if snap['last'] and now-snap['last'] > 2:
+                            raise RuntimeError('Нет новых кадров WGC более 2 секунд.')
+                        if snap['last']:
+                            if healthy_since is None:
+                                healthy_since = now
+                                logger.info('WGC frames resumed hwnd=%s sequence=%s', self.hwnd, snap['count'])
+                            if now-healthy_since >= 10:
+                                failures = 0
+                except Exception as exc:
+                    reason = str(exc)
+                finally:
+                    stop_capture()
+                    self.clear_session_frame()
+                if self._stop.is_set():
+                    break
+                if reason is not None:
+                    failures += 1
+                    self._recoveries += 1
+                    delay = min(30, 2 ** min(failures-1, 5))
+                    with self._lock:
+                        self._state = f'Восстановление WGC через {delay} с: {reason}'
+                    logger.warning('WGC retry=%s delay=%ss hwnd=%s: %s',
+                                   self._recoveries, delay, self.hwnd, reason)
+                    if self._stop.wait(delay):
+                        break
         except Exception as exc:
             self.fail(exc)
         finally:
-            if control is not None:
-                try:
-                    control.stop()  # Joining native capture happens OFF the GUI thread.
-                except Exception as exc:
-                    self.fail(exc)
-            if capture is not None:
-                capture.frame_handler = capture.closed_handler = None
+            try:
+                stop_capture()
+            except Exception as exc:
+                logger.exception('WGC cleanup failed: %s', exc)
             with self._lock:
                 self._frame = None
                 if not self._error:
                     self._state = 'Остановлено; ресурсы WGC освобождены'
+            logger.info('WGC stopped hwnd=%s error=%s', self.hwnd, self._error)

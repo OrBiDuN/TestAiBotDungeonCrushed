@@ -33,3 +33,9 @@ if __name__ == '__main__':
     for name, (i, (x, y, w, h)) in specs.items():
         pixels = read_reference(i)
         cv2.imencode('.png', pixels[y:y+h, x:x+w])[1].tofile(folder / f'{name}.png')
+    popup = cv2.imdecode(np.fromfile(ROOT/'tests'/'fixtures'/'attack_failed_popup.png', np.uint8), cv2.IMREAD_COLOR)
+    cv2.imencode('.png', popup[455:632,130:540])[1].tofile(folder/'attack_failed_ok.png')
+    gold = cv2.imdecode(np.fromfile(ROOT/'tests'/'fixtures'/'offline-gold.jpg', np.uint8), cv2.IMREAD_COLOR)
+    # 1280x720 reference -> the supported 1920x1080 game layout.
+    gold = cv2.resize(gold, (1920, 1080))
+    cv2.imencode('.png', gold[390:597,795:1125])[1].tofile(folder/'offline_gold_ok.png')

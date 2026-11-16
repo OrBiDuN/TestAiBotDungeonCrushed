@@ -1,5 +1,6 @@
 """Latest-only passive vision and a finite, explicitly started boss search."""
 import time
+from human_input import scroll_interval
 from PySide6.QtCore import QThread
 from siege import ButtonMatcher, SiegeRoute, pixels
 import winmouse as win
@@ -19,7 +20,7 @@ class SceneDetector:
         self.cards = CardDetector()
 
     def inspect(self, image):
-        if self.matcher.find(image, 'battle_close') and self.matcher.find(image, 'battle_turn'):
+        if self.matcher.battle_ready(image):
             return {'scene': 'Бой — крестик найден', 'track': None}
         if self.matcher.find(image, 'boss_done'):
             return {'scene': 'Осада босса завершена', 'track': None}
@@ -47,6 +48,7 @@ class VisionWorker(QThread):
         self.capture = capture
         self.result = None
         self.ocr_result = None
+        self.relogin_result = None
         import uuid
         self.session = uuid.uuid4().hex
         self.store = getattr(parent,'boss_store',None)
@@ -70,6 +72,12 @@ class VisionWorker(QThread):
                 if time.monotonic() >= next_ocr:
                     next_ocr = time.monotonic()+1
                     try:
+                        from relogin import detect
+                        match = detect(pixels(frame.image))
+                        self.relogin_result = dict(match=match, received=frame.received, sequence=sequence, error=None)
+                    except Exception as exc:
+                        self.relogin_result = dict(match=None, received=frame.received, sequence=sequence, error=str(exc))
+                    try:
                         if reader is None:
                             from bossocr import BossReader
                             reader = BossReader(self.store)
@@ -91,6 +99,12 @@ class VisionWorker(QThread):
 
 
 class BossSearch(SiegeRoute):
+    def recover_error(self, exc):
+        if self.active and getattr(self,'combat',None) is not None:
+            self.combat.recover(exc)
+            return True
+        return False
+
     """Find again after every click. Never attack or search for a clan boss."""
     def start(self, navigation_only=False, open_boss=False, attack_once=False, kill_boss=False, endless=False):
         super().start(True)
@@ -110,6 +124,7 @@ class BossSearch(SiegeRoute):
         self.kill_boss = kill_boss
         self.endless = endless
         self.completed_bosses = 0
+        self.total_attacks = 0
         self.combat = None
         if getattr(self.ui,'vision',None) and hasattr(self.ui.vision,'route_id'):
             self.ui.vision.route_id = self.run_id
@@ -178,6 +193,7 @@ class BossSearch(SiegeRoute):
         # Card portrait becomes an identity guard in the following boss menu.
         x,y=card['anchor']
         self.selected_portrait = image[y-150:y-55,x-350:x-260].copy()
+        self.save_endless_frame(frame, 'found')
 
     def verify_search_click(self, expected):
         frame = self.frame()
@@ -204,9 +220,18 @@ class BossSearch(SiegeRoute):
                 ui.stop()
                 return
             now = time.monotonic()
+            if self.wait_for_video():
+                return
             if getattr(self, 'combat', None) is not None:
                 self.combat.tick()
                 return
+            if getattr(self,'endless',False) and ui.operation is None and self.phase!='wake':
+                frame=self.frame()
+                if self.matcher.find(pixels(frame.image),'attack_failed_ok'):
+                    from bosscombat import CombatCycle
+                    self.combat=CombatCycle(self)
+                    self.combat.tick()
+                    return
             if self.phase == 'wait_next_track':
                 frame = self.frame()
                 if self.matcher.find(pixels(frame.image), 'track'):
@@ -224,7 +249,7 @@ class BossSearch(SiegeRoute):
                 if win.position() != ui.point:
                     raise RuntimeError('Курсор сдвинут; прокрутка отменена.')
                 self.phase = 'scroll_burst'
-                self.timer.setInterval(10)
+                self.timer.setInterval(scroll_interval())
                 scroll_step(self.scroll_direction)
                 self.scroll_remaining -= 1
                 if self.scroll_remaining == 0:
@@ -378,6 +403,7 @@ class BossSearch(SiegeRoute):
             ui.operation['check_before_click'] = lambda: self.verify_search_click(point)
             self.phase = 'click'
         except Exception as exc:
+            if self.recover_error(exc):return
             self.cancel(f'Поиск прерван: {exc}')
             self.ui.cancel()
 

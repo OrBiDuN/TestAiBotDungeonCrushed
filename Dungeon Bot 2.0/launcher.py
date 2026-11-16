@@ -1,6 +1,7 @@
 import math
 import sys
 import time
+import human_input
 from datetime import datetime
 from pathlib import Path
 
@@ -13,13 +14,15 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 from PySide6.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox,
                               QDialog, QFormLayout, QHBoxLayout, QLabel, QMainWindow,
-                              QPushButton, QTextEdit, QVBoxLayout, QWidget)
+                              QPushButton, QTextEdit, QVBoxLayout, QWidget, QMenu)
 from gamearea import GameArea
 from calibration import CalibrationDialog
 from livecapture import LiveCapture
+from runtime_log import logger
 from windowwake import WindowWake
 
-BASE = Path(__file__).resolve().parent
+from app_paths import APP_DIR
+BASE = APP_DIR
 
 
 class Launcher(QMainWindow):
@@ -34,6 +37,17 @@ class Launcher(QMainWindow):
         self.steam_targets = {}
         self._closing = False
         self.siege = None
+        self.telegram = None
+        self.telegram_was_active = False
+        self.telegram_started = None
+        self.desktop_restore_deadline = None
+        self.relogin_required = False
+        self.relogin_sequence = -1
+        self.relogin_absent = 0
+        self.telegram_setup = None
+        self.mode_selection = False
+        self.telegram_menu_state = None
+        self.telegram_menu_checked = 0
         self.vision = None
         self.last_boss_log = None
         self.last_ocr_sequence = -1
@@ -87,6 +101,7 @@ class Launcher(QMainWindow):
         preview_layout.addWidget(self.live_metrics)
         preview_layout.addWidget(self.button('Осады: проверить распознавание без кликов', self.inspect_siege))
         preview_layout.addWidget(self.button('Боссы — каталог и текущие осады', self.open_boss_panel))
+        preview_layout.addWidget(self.button('Перезайти в игру (окно другого устройства)', self.start_relogin))
         self.route_buttons = [
             self.button('БЕСКОНЕЧНО: 1 босс → добить → следующий', self.start_endless_bosses),
             self.button('Поиск → первый босс → добить → Назад', lambda: self.start_boss_search(kill_boss=True)),
@@ -115,6 +130,10 @@ class Launcher(QMainWindow):
         heading = QLabel('Dungeon Bot 2.0 · Окно и игровая область')
         heading.setStyleSheet('font-size: 20px; font-weight: 600;')
         layout.addWidget(heading)
+        layout.addWidget(self.button('Подключить Telegram / показать привязку', self.connect_telegram))
+        self.telegram_label = QLabel('Telegram отключён')
+        self.telegram_label.setWordWrap(True)
+        layout.addWidget(self.telegram_label)
         note = QLabel('Steam / Windows · Live Capture. Ввод запускается только кнопками.\n'
                       'СТОП или удерживание Esc отменяет запись, движение и ожидающий клик.\n'
                       'Esc проверяется без перехвата клавиатуры.')
@@ -175,6 +194,310 @@ class Launcher(QMainWindow):
         self.video_timer = QTimer(self)
         self.video_timer.timeout.connect(self.poll_live)
         self.video_timer.start(16)
+        self.telegram_timer = QTimer(self)
+        self.telegram_timer.timeout.connect(self.poll_telegram)
+        self.telegram_timer.start(100)
+        from autopilot import Autopilot
+        self.autopilot = Autopilot(self)
+        self.auto_timer = QTimer(self)
+        self.auto_timer.timeout.connect(self.poll_autopilot)
+        self.auto_timer.start(200)
+        self.build_simple_ui()
+
+    def build_simple_ui(self):
+        advanced_body = self.takeCentralWidget()
+        self.advanced_dialog = QDialog(self)
+        self.advanced_dialog.setWindowTitle('Технические настройки')
+        self.advanced_dialog.resize(1100, 800)
+        QVBoxLayout(self.advanced_dialog).addWidget(advanced_body)
+        body = QWidget()
+        self.setCentralWidget(body)
+        layout = QVBoxLayout(body)
+        title = QLabel('Dungeon Bot · Автоматический режим')
+        title.setStyleSheet('font-size: 22px; font-weight: 600;')
+        layout.addWidget(title)
+        layout.addWidget(QLabel('Запустить → Бесконечный режим. Остальные шаги бот выполнит сам.'))
+        row = QHBoxLayout()
+        self.auto_start_button = QPushButton('▶ Запустить')
+        menu = QMenu(self.auto_start_button)
+        menu.addAction('Бесконечный режим', lambda: self.guard(self.autopilot.start))
+        self.auto_start_button.setMenu(menu)
+        row.addWidget(self.auto_start_button)
+        row.addWidget(self.button('■ Стоп', self.stop))
+        row.addWidget(self.button('Скриншот', self.save_live_screenshot))
+        row.addWidget(self.button('Статистика', self.show_statistics))
+        layout.addLayout(row)
+        layout.addWidget(self.telegram_label)
+        layout.addWidget(self.scene_label)
+        layout.addWidget(self.preview, 2)
+        layout.addWidget(self.status)
+        layout.addWidget(self.log, 1)
+        self.advanced_button = self.button('Технические настройки', self.advanced_dialog.show)
+        layout.addWidget(self.advanced_button)
+        self.status.setText('Готов. Нажмите «Запустить» и выберите режим.')
+        self.resize(1000, 780)
+
+    def poll_autopilot(self):
+        if self._closing:
+            return
+        if self.autopilot.active and win.user32.GetAsyncKeyState(0x1B) & 0x8000:
+            self.stop()
+            return
+        self.autopilot.tick()
+        self.auto_start_button.setEnabled(not self.autopilot.active and not bool(self.siege and self.siege.active))
+        self.advanced_button.setEnabled(not self.autopilot.active)
+        if self.autopilot.active:
+            self.advanced_dialog.hide()
+
+    def save_live_screenshot(self):
+        frame = self.latest_video_frame()
+        if not frame or time.perf_counter() - frame.received > 2:
+            raise RuntimeError('Нет свежего кадра игры.')
+        folder = BASE / 'screenshots'
+        folder.mkdir(exist_ok=True)
+        path = folder / f'capture-{datetime.now():%Y%m%d-%H%M%S-%f}.png'
+        if not frame.image.save(str(path), 'PNG'):
+            raise RuntimeError('Не удалось сохранить PNG.')
+        self.last_screenshot = str(path)
+        self.report('Скриншот сохранён: ' + str(path))
+
+    def show_statistics(self):
+        self.report(self.autopilot.statistics())
+
+
+    def connect_telegram(self):
+        if self.telegram is None:
+            from telegram_control import TelegramRemote
+            remote = TelegramRemote(BASE)
+            remote.start()
+            self.telegram = remote
+        if not self.telegram.owner:
+            # Pairing secret appears only locally, never in the shared event log.
+            self.telegram_label.setText('В личном чате бота отправьте: /pair ' + self.telegram.code +
+                                       '\nКод действует 10 минут. При истечении перезапустите Launcher.')
+        else:
+            self.telegram_label.setText('Telegram подключается…')
+
+    def telegram_ready(self):
+        try:
+            if not self.bound or not self.area or not self.live or not self.live.isRunning():
+                return False
+            import psutil
+            if psutil.Process(win.identity(self.bound)[1]).name().casefold() != 'dungeoncrusher.exe':
+                return False
+            self.area.rectangle()
+            if (self.live.hwnd != self.bound or self.live.area != self.area or
+                    self.area.crop[:2] != (0, 0) or self.area.crop[2:] != self.area.size):
+                return False
+            frame = self.latest_video_frame()
+            return bool(frame and time.perf_counter() - frame.received < 2)
+        except Exception:
+            return False
+
+    def show_telegram_menu(self, force=False, prefix=''):
+        from telegram_control import MENU, MODE_MENU, ACTIVE_MENU
+        active = self.autopilot.active or bool(self.siege and self.siege.active)
+        state = 'active' if active else 'mode' if self.mode_selection else 'idle'
+        if not force and state == self.telegram_menu_state:
+            return
+        self.telegram_menu_state = state
+        text, menu = {
+            'idle': ('Нажмите «Запустить», затем выберите режим. Подготовлю игру автоматически.', MENU),
+            'mode': ('Выберите режим:', MODE_MENU),
+            'active': ('Бот работает. Доступны остановка, экран и статистика.', ACTIVE_MENU),
+        }[state]
+        self.telegram.notify((prefix + '\n' if prefix else '') + text, menu=menu)
+
+    def prepare_telegram_game(self, capture):
+        if self.telegram_setup or (self.siege and self.siege.active):
+            self.show_telegram_menu(True, 'Действие уже выполняется. Для перенастройки сначала остановите его.')
+            return
+        if self.operation or self.recorder.handle or self.calibration_dialog or self.capture_timer.isActive():
+            self.show_telegram_menu(True, 'Выполняется ручное действие. Сначала нажмите «Остановить».')
+            return
+        if not self.find_steam():
+            self.show_telegram_menu(True, 'Окно игры не найдено. Игра должна быть запущена на компьютере; повторите поиск.')
+            return
+        original = self.pending_activation['action']
+        self.telegram_setup = {'phase': 'wake', 'capture': capture, 'deadline': time.monotonic() + 15}
+        def ready():
+            original()
+            if self.telegram_setup:
+                self.telegram_setup['phase'] = 'capture'
+        self.pending_activation['action'] = ready
+        self.show_telegram_menu(True)
+
+    def advance_telegram_setup(self):
+        setup = self.telegram_setup
+        if not setup:
+            return
+        if time.monotonic() > setup['deadline']:
+            self.cancel()
+            self.show_telegram_menu(True, 'Не удалось получить свежий кадр за 15 секунд. Повторите подготовку области.')
+            return
+        if setup['phase'] == 'capture':
+            if not setup['capture']:
+                self.telegram_setup = None
+                self.show_telegram_menu(True, 'Игра найдена, окно и область выбраны.')
+            elif not self.live or not self.live.isRunning():
+                self.start_live()
+                setup['phase'] = 'frame'
+        elif setup['phase'] == 'frame' and self.telegram_ready():
+            self.telegram_setup = None
+            self.show_telegram_menu(True, 'Подготовка завершена, свежий кадр получен.')
+
+    def restore_desktop(self):
+        import desktop_session
+        self.cancel()
+        if self.desktop_restore_deadline:
+            self.telegram.notify('Восстановление рабочего стола уже выполняется.')
+            return
+        if desktop_session.request_restore():
+            self.desktop_restore_deadline = time.monotonic() + 20
+            self.telegram.notify('Запрошен перенос RDP-сеанса на локальный экран ПК. Проверяю результат…')
+        else:
+            self.telegram.notify(desktop_session.describe() + '\nЕсли виден экран блокировки, разблокируйте Windows вручную. Если рабочий стол доступен — отправьте /setup.')
+
+    def poll_desktop_restore(self):
+        if self.desktop_restore_deadline is None:
+            return
+        import desktop_session
+        info = desktop_session.snapshot()
+        if info['state'] == 0 and info['console'] == info['session'] and info['foreground']:
+            self.desktop_restore_deadline = None
+            self.telegram.notify('Сеанс подключён к локальному экрану, активное окно доступно. Отправьте /setup для проверки игры. Автозапуска игровых действий нет.')
+        elif time.monotonic() >= self.desktop_restore_deadline:
+            self.desktop_restore_deadline = None
+            self.telegram.notify('Восстановление рабочего стола не подтверждено. ' + desktop_session.describe(info) + '\nПодключитесь по RDP и проверьте экран блокировки.')
+
+    def telegram_status(self):
+        import desktop_session
+        try:
+            desktop = desktop_session.describe()
+        except Exception as exc:
+            desktop = str(exc)
+        route = self.siege
+        active = bool(route and route.active)
+        duration = int(time.monotonic() - self.telegram_started) if active and self.telegram_started else 0
+        frame = self.latest_video_frame()
+        age = f'{time.perf_counter()-frame.received:.1f} с' if frame else 'нет'
+        return (desktop + '\n' + f'Игра: {"требуется перезайти" if self.relogin_required else "окно перезахода не обнаружено"}\n'
+                f'Режим: {"работает" if active else "остановлен"}\n'
+                f'Бесконечный: {"да" if active and getattr(route, "endless", False) else "нет"}\n'
+                f'Этап: {getattr(route, "phase", "—")}\n'
+                f'Завершено боссов: {getattr(route, "completed_bosses", 0)}\n'
+                f'Время работы: {duration} с\nВозраст кадра: {age}\n'
+                f'Последнее событие: {self.status.text()}')
+
+    def poll_telegram(self):
+        remote = self.telegram
+        if remote is None or self._closing:
+            return
+        try:
+            if remote.owner:
+                self.telegram_label.setText('Telegram: на связи' if remote.connected else
+                                           'Telegram: ' + (remote.connection_error or 'подключение…'))
+            active = bool(self.siege and self.siege.active)
+            command = remote.next_command()
+            if self.autopilot.active and command in ('find', 'setup', 'relogin', 'desktop'):
+                remote.notify('Подготовка и восстановление выполняются автоматически. Для ручной настройки сначала остановите режим.')
+                command = None
+            if self.desktop_restore_deadline and command not in (None, 'stop', 'status', 'menu', 'desktop'):
+                remote.notify('Дождитесь завершения восстановления рабочего стола.')
+                command = None
+            if command == 'stop':
+                self.autopilot.stop()
+                self.mode_selection = False
+                self.desktop_restore_deadline = None
+                self.cancel()
+                remote.notify('Остановлено. Ожидающие действия отменены; захват игры сохранён.')
+                self.show_telegram_menu(True)
+            elif command in ('find', 'setup'):
+                self.prepare_telegram_game(capture=command == 'setup')
+            elif command == 'desktop':
+                self.restore_desktop()
+            elif command == 'relogin':
+                self.start_relogin()
+                self.show_telegram_menu(True)
+            elif command == 'run':
+                if self.autopilot.active or (self.siege and self.siege.active):
+                    remote.notify('Режим уже работает.', menu=__import__('telegram_control').ACTIVE_MENU)
+                else:
+                    self.mode_selection = True
+                    self.show_telegram_menu(True)
+            elif command == 'endless':
+                self.autopilot.start()
+                self.show_telegram_menu(True)
+            elif command == 'screen':
+                frame = self.latest_video_frame()
+                if not frame or time.perf_counter() - frame.received > 2:
+                    self.show_telegram_menu(True, 'Нет свежего кадра игры. Во время запуска дождитесь подготовки окна.')
+                else:
+                    from PySide6.QtCore import QBuffer, QIODevice
+                    image = frame.image.copy()
+                    image = image.scaled(1600, 1600, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    buffer = QBuffer()
+                    buffer.open(QIODevice.WriteOnly)
+                    if not image.save(buffer, 'JPEG', 85):
+                        raise RuntimeError('Не удалось подготовить кадр')
+                    remote.notify('Окно игры · ' + datetime.fromtimestamp(frame.wall_time).strftime('%H:%M:%S'),
+                                  photo=bytes(buffer.data()))
+            elif command == 'status':
+                remote.notify(self.autopilot.statistics())
+            elif command == 'menu':
+                self.show_telegram_menu(True)
+            self.advance_telegram_setup()
+            self.poll_desktop_restore()
+            if remote.owner and time.monotonic() - self.telegram_menu_checked > 1:
+                self.telegram_menu_checked = time.monotonic()
+                self.show_telegram_menu()
+            active = bool(self.siege and self.siege.active)
+            if not self.autopilot.active and active != self.telegram_was_active:
+                self.telegram_was_active = active
+                if active:
+                    self.telegram_started = time.monotonic()
+                    remote.notify('Режим запущен.\n' + self.telegram_status())
+                else:
+                    remote.notify('Режим остановлен.\n' + self.status.text())
+        except Exception as exc:
+            # A rejected query must not cancel an unrelated running route.
+            remote.notice('Ошибка команды: ' + str(exc))
+            if self.telegram_setup:
+                self.cancel()
+            self.show_telegram_menu(True)
+
+    def start_relogin(self):
+        from relogin import ReloginRoute
+        if self.siege and self.siege.active:
+            self.report('Сначала остановите текущее действие.')
+            return
+        if not self.relogin_required:
+            raise RuntimeError('Окно «Перезайти» пока не распознано.')
+        if self.siege:
+            self.siege.timer.deleteLater()
+        self.siege = ReloginRoute(self)
+        self.siege.start_relogin()
+
+    def poll_relogin(self):
+        from relogin import ReloginRoute
+        result = getattr(self.vision, 'relogin_result', None)
+        if not result or result['sequence'] == self.relogin_sequence or time.perf_counter()-result['received'] > 2:
+            return
+        self.relogin_sequence = result['sequence']
+        if result.get('error'):
+            return
+        if result.get('match'):
+            self.relogin_absent = 0
+            if not self.relogin_required:
+                self.relogin_required = True
+                if not isinstance(self.siege, ReloginRoute):
+                    self.cancel()
+                self.report('Требуется перезайти: вход с другого устройства. Игровые действия остановлены.')
+            self.scene_label.setText('Экран: требуется перезайти')
+        else:
+            self.relogin_absent += 1
+            if self.relogin_absent >= 2:
+                self.relogin_required = False
 
     def open_boss_panel(self):
         if self.boss_panel is None:
@@ -222,6 +545,8 @@ class Launcher(QMainWindow):
         self.siege.start(open_boss=True, attack_once=attack_once, kill_boss=kill_boss)
 
     def start_endless_bosses(self):
+        if self.relogin_required:
+            raise RuntimeError('Сначала нажмите «Перезайти» и дождитесь загрузки игры.')
         if self.siege and self.siege.active:
             self.report('Маршрут уже выполняется; повторный запуск пропущен.')
             return
@@ -298,6 +623,8 @@ class Launcher(QMainWindow):
         if self.vision:
             self.vision.deleteLater()
         self.vision = VisionWorker(self.live, self)
+        self.relogin_sequence = -1
+        self.relogin_absent = 0
         self.last_boss_log = None
         self.last_ocr_sequence = -1
         self.vision.start()
@@ -360,6 +687,7 @@ class Launcher(QMainWindow):
         self.live_metrics.setText(f'FPS: {actual:.1f} · Кадров: {snap["count"]} · Размер: {size}\n'
                                   f'Копирование: {snap["copy_ms"]:.2f} мс · Возраст кадра WGC: {latency}')
         self.live_status.setText(snap['state'])
+        self.poll_relogin()
         self.live_start.setEnabled(not self.live.isRunning())
         if self._closing and not self.live.isRunning():
             self.close()
@@ -380,7 +708,7 @@ class Launcher(QMainWindow):
                 self.report(f'Процесс найден (PID {list(processes)}), но видимое игровое окно пока отсутствует.')
             else:
                 self.report(f'dungeoncrusher.exe не запущен. Запустите Steam-клиент и повторите поиск. Путь: {STEAM_EXE}')
-            return
+            return False
         for item in windows:
             index = self.windows.findData(item['hwnd'])
             label = f'Steam · PID {item["pid"]} · HWND {item["hwnd"]} · {item["title"]}'
@@ -397,6 +725,7 @@ class Launcher(QMainWindow):
                         'Нажмите «Начать трансляцию».')
         self.pending_activation = dict(wake=WindowWake(self.bound), action=ready)
         self.report('Пробуждаю найденное Steam-окно…')
+        return True
 
     def use_client_area(self):
         if not self.bound:
@@ -405,14 +734,20 @@ class Launcher(QMainWindow):
         self.set_area((0, 0, r-l, b-t))
 
     def report(self, text):
+        logger.info('%s', text)
         self.status.setText(text)
         self.log.append(f'{datetime.now():%H:%M:%S}  {text}')
+        if self.telegram and any(word in text.casefold() for word in ('ошиб', 'не удалось', 'неизвест', 'таймаут')):
+            self.telegram.notice(text)
 
     def guard(self, function):
         try:
             function()
         except Exception as exc:
             try:
+                recover=getattr(self.siege,'recover_error',None)
+                if recover and recover(exc):
+                    return
                 self.cancel()
             except Exception as cleanup:
                 self.report(f'Ошибка освобождения ввода: {cleanup}')
@@ -508,11 +843,32 @@ class Launcher(QMainWindow):
             raise RuntimeError('Отпустите левую кнопку мыши перед запуском.')
         if self.bound:
             self.operation = dict(phase='wake', wake=WindowWake(self.bound), click=click, fast=fast)
+            if from_route:
+                variation = human_input.profile(getattr(self, '_last_input_offset', None))
+                self.operation['variation'] = variation
+                if click:
+                    self.vary_route_point()
             self.report('Пробуждаю игровое окно перед действием…')
             return
         self.validate_target()
         self.operation = dict(phase='countdown', due=time.monotonic() + 1.0, click=click)
         self.report('Старт через 1 секунду. Для отмены удерживайте Esc или нажмите СТОП.')
+
+    def vary_route_point(self):
+        """Offset the input point only; recognition callbacks retain their anchors."""
+        variation = self.operation['variation']
+        dx, dy = variation['offset']
+        x, y = self.relative_point
+        self.relative_point = (x + dx, y + dy)
+        self.point = self.area.absolute(self.relative_point)
+        self._last_input_offset = (dx, dy)
+
+    def movement_duration(self, op, origin):
+        distance = math.dist(origin, self.point)
+        variation = op.get('variation')
+        if variation:
+            return max(variation['duration_floor'], distance / variation['speed'])
+        return max(.08, distance / 6000) if op.get('fast') else max(.2, distance / self.speed.value())
 
     def tick(self):
         self.guard(self.advance)
@@ -534,6 +890,11 @@ class Launcher(QMainWindow):
         op = self.operation
         if not op:
             return
+        # Let mouseUp complete even if video disappears after mouseDown.
+        # Other route input waits and is revalidated against a fresh frame.
+        if op.get('check_before_click') and op['phase'] not in ('wake', 'release'):
+            if self.siege and self.siege.active and self.siege.wait_for_video():
+                return
         if op['phase'] == 'wake':
             if not op['wake'].poll():
                 return
@@ -541,16 +902,19 @@ class Launcher(QMainWindow):
             if self.area and self.relative_point is not None:
                 self.point = self.area.absolute(self.relative_point)
             self.validate_target()
-            op.update(phase='countdown', due=time.monotonic()+(.02 if op.get('fast') else .4))
+            delay = op['variation']['reaction'] if op.get('variation') else (.02 if op.get('fast') else .4)
+            op.update(phase='countdown', due=time.monotonic()+delay)
             self.report('Игровое окно активно; положение и фокус проверены.')
             return
         self.validate_target()
         now = time.monotonic()
         if op['phase'] == 'countdown' and now >= op['due']:
             op.update(phase='moving', start=now, origin=win.position())
-            op['duration'] = max(0.08, math.dist(op['origin'], self.point) / 6000) if op.get('fast') else max(0.2, math.dist(op['origin'], self.point) / self.speed.value())
+            op['duration'] = self.movement_duration(op, op['origin'])
         if op['phase'] == 'moving':
             fraction = min(1.0, (now - op['start']) / op['duration'])
+            if op.get('variation'):
+                fraction = fraction * fraction * (3 - 2 * fraction)
             target = tuple(round(a + (b - a) * fraction) for a, b in zip(op['origin'], self.point))
             win.move(*target)
             if fraction >= 1:
@@ -565,7 +929,7 @@ class Launcher(QMainWindow):
                     self.operation = None
                     self.report(f'Перемещение подтверждено GetCursorPos: {actual}.')
                 else:
-                    pause = .08 if op.get('fast') else self.pause.value()
+                    pause = op['variation']['pause'] if op.get('variation') else (.08 if op.get('fast') else self.pause.value())
                     op.update(phase='pause', due=now + pause)
                     self.report(f'Курсор в {actual}. Пауза {pause:.2f} с перед кликом…')
         elif op['phase'] == 'pause' and now >= op['due']:
@@ -574,11 +938,21 @@ class Launcher(QMainWindow):
             if win.user32.GetAsyncKeyState(1) & 0x8000:
                 raise RuntimeError('Левая кнопка уже удерживается. Клик отменён.')
             if op.get('check_before_click'):
-                op['check_before_click']()
+                result = op['check_before_click']()
+                if result == 'retarget':
+                    # The previous location was not clicked. Return to the regular
+                    # movement phase using the newly verified button coordinates.
+                    origin = win.position()
+                    if op.get('variation'):
+                        self.vary_route_point()
+                    op.update(phase='moving', start=now, origin=origin)
+                    op['duration'] = self.movement_duration(op, origin)
+                    self.report(f'Кнопка сместилась; курсор перенаведён к {self.point}.')
+                    return
                 self.validate_target()
             win.send(0x0002)
             self.held = True
-            op.update(phase='release', due=now + 0.06)
+            op.update(phase='release', due=now + (op['variation']['hold'] if op.get('variation') else .06))
         elif op['phase'] == 'release' and now >= op['due']:
             self.release()
             self.operation = None
@@ -591,6 +965,7 @@ class Launcher(QMainWindow):
             self.held = False
 
     def cancel(self, cancel_route=True):
+        self.telegram_setup = None
         self.pending_activation = None
         if cancel_route and self.siege:
             self.siege.cancel()
@@ -604,6 +979,8 @@ class Launcher(QMainWindow):
             self.release()
 
     def stop(self):
+        self.autopilot.stop()
+        self.mode_selection = False
         self.stop_live()
         self.cancel()
         self.report('СТОП: ожидающие действия отменены, запись выключена, кнопка освобождена.')
@@ -736,6 +1113,8 @@ class Launcher(QMainWindow):
         self.report(f'PNG сохранён ({image.width()}×{image.height()}): {path}.')
 
     def closeEvent(self, event):
+        self.autopilot.stop()
+        self.advanced_dialog.close()
         if self.vision:
             self.vision.requestInterruption()
             self.vision.wait()
@@ -756,6 +1135,8 @@ class Launcher(QMainWindow):
         if not getattr(self,'_store_closed',False):
             self.boss_store.close()
             self._store_closed=True
+        if self.telegram:
+            self.telegram.close()
         event.accept()
 
 
@@ -764,6 +1145,8 @@ def main():
     app.setStyle('Fusion')
     window = Launcher()
     window.show()
+    if '--telegram' in sys.argv:
+        QTimer.singleShot(0, lambda: window.guard(window.connect_telegram))
     if '--bosses' in sys.argv:
         window.open_boss_panel()
     if '--selfcheck' in sys.argv:

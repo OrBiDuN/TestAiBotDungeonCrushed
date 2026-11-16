@@ -10,9 +10,11 @@ from PySide6.QtGui import QImage
 import winmouse as win
 from windowwake import WindowWake
 
-ROOT = Path(__file__).parent
+from app_paths import APP_DIR, RESOURCE_DIR
+ROOT = APP_DIR
 STEPS = ('home', 'ranking', 'track', 'card', 'normal')
 LABELS = dict(home='Осады на главном экране', ranking='Осады в рейтинге',
+              offline_gold_ok='ОК — золото за время отсутствия',
               track='Выследить босса', card='Атаковать в карточке', normal='Обычная Атака', all='На все')
 
 
@@ -24,8 +26,8 @@ def pixels(image):
 
 class ButtonMatcher:
     def __init__(self):
-        self.templates = {name: cv2.imdecode(np.fromfile(ROOT/'assets'/'siege'/f'{name}.png', np.uint8),
-                                            cv2.IMREAD_COLOR) for name in (*STEPS, 'all', 'battle_close', 'battle_turn', 'boss_done', 'boss_back')}
+        self.templates = {name: cv2.imdecode(np.fromfile(RESOURCE_DIR/'assets'/'siege'/f'{name}.png', np.uint8),
+                                            cv2.IMREAD_COLOR) for name in (*STEPS, 'all', 'battle_close', 'battle_turn', 'boss_done', 'boss_back', 'attack_failed_ok', 'offline_gold_ok')}
 
     def find(self, image, name):
         h, w = image.shape[:2]
@@ -33,12 +35,18 @@ class ButtonMatcher:
         if not (1850 <= w <= 1950 and 1020 <= h <= 1120):
             raise RuntimeError(f'Для маршрута нужны кадры около 1920×1080; сейчас {w}×{h}. '
                                'Масштабировать координаты вслепую запрещено.')
-        if name == 'battle_close':
+        if name == 'offline_gold_ok':
+            x0, y0, x1, y1 = 650, 300, min(w, 1250), min(h, 750)
+        elif name == 'attack_failed_ok':
+            x0, y0, x1, y1 = 500, 300, min(w, 1400), min(h, 800)
+        elif name == 'battle_close':
             x0, y0, x1, y1 = w-110, 0, w, 120
         elif name == 'battle_turn':
             x0, y0, x1, y1 = 0, 0, 220, 110
         elif name == 'home':
-            x0, y0, x1, y1 = 630, 560, 780, min(h, 820)
+            # The sidebar moves Sieges up when the Events entry is absent.
+            # Search both layouts by the icon, keeping the same match threshold.
+            x0, y0, x1, y1 = 630, 440, 780, min(h, 820)
         else:
             x0, y0, x1, y1 = 680, 200 if name in ('track', 'card') else 750, min(w, 1240), min(h, 1050)
         roi = image[y0:y1, x0:x1]
@@ -56,12 +64,29 @@ class ButtonMatcher:
                 patch = roi[y:y+th, x:x+tw]
                 error = float(np.mean(np.abs(patch.astype(np.float32)-template)))
                 if error < 24:
-                    candidates.append(dict(point=(x0+x+tw//2, y0+y+th//2), rect=(x0+x, y0+y, tw, th), score=score, error=error))
+                    point = (x0+x+tw//2, y0+y+th//2)
+                    if name == 'attack_failed_ok':
+                        # Reference includes BOTH exact error text and OK, not a generic red button.
+                        point = (x0+x+round(205*scale), y0+y+round(142*scale))
+                    elif name == 'offline_gold_ok':
+                        point = (x0+x+round(165*scale), y0+y+round(170*scale))
+                    candidates.append(dict(point=point, rect=(x0+x, y0+y, tw, th), score=score, error=error))
                 result[max(0,y-th//2):y+th//2+1, max(0,x-tw//2):x+tw//2+1] = -1
         if not candidates:
             return None
         # The uppermost visible ordinary boss, never the clan search.
         return min(candidates, key=lambda c: c['point'][1]) if name == 'card' else max(candidates, key=lambda c:c['score'])
+
+    def battle_ready(self, image):
+        """The battle HUD varies by map, while its top-right red exit cross is stable.
+
+        This is only called after the bot has just sent one ordinary attack, never
+        as a general-purpose close button detector.
+        """
+        close = self.find(image, 'battle_close')
+        if not close:
+            return None
+        return close
 
 
 class SiegeRoute:
@@ -94,6 +119,60 @@ class SiegeRoute:
             raise RuntimeError('Кадр и калибровка не соответствуют друг другу.')
         return frame
 
+    def save_endless_frame(self, frame, stage, attack=0):
+        """Archive the verified full game frame once per boss/stage/attack."""
+        if not getattr(self, 'endless', False):
+            return
+        boss = getattr(self, 'completed_bosses', 0) + 1
+        token = (boss, stage, attack)
+        saved = getattr(self, '_archived_frames', set())
+        if token in saved:
+            return
+        folder = ROOT/'screenshots'/'endless'/str(self.run_id)
+        stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+        path = folder/f'boss-{boss:05d}_{stage}_attack-{attack:03d}_{stamp}.png'
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            if not frame.image.save(str(path), 'PNG'):
+                raise OSError('Не удалось записать PNG')
+        except Exception as exc:
+            self.log(f'Не удалось сохранить скриншот: {exc}', path=str(path))
+            return
+        saved.add(token)
+        self._archived_frames = saved
+        self.log('Скриншот бесконечного режима сохранён: '+str(path),
+                 stage=stage, boss=boss, attack=attack, sequence=frame.sequence)
+
+    def wait_for_video(self):
+        """Freeze observation timers during transport gaps; never resend actions."""
+        live = getattr(self, 'live', None)
+        if live is None or self.ui.live is not live or self.phase == 'wake':
+            return False
+        if not live.isRunning() or live.snapshot()['error']:
+            self.cancel('Видеозахват остановлен. Запустите трансляцию заново.')
+            self.ui.cancel()
+            return True
+        now = time.monotonic()
+        previous = getattr(self, '_video_pause', None)
+        if previous is not None:
+            delta = now-previous
+            for target in (self, getattr(self, 'combat', None)):
+                if target is None:
+                    continue
+                for key in ('deadline', 'ready', 'read_deadline', 'read_min_time',
+                            'confirm_deadline', 'next_track_deadline', 'expires'):
+                    value = getattr(target, key, None)
+                    if isinstance(value, (float, int)):
+                        setattr(target, key, value+delta)
+        frame = live.latest_frame()
+        waiting = frame is None or time.perf_counter()-frame.received > .5
+        self._video_pause = now if waiting else None
+        if waiting and previous is None:
+            self.log('Пауза действий: ожидаю восстановление свежих кадров WGC.')
+        elif not waiting and previous is not None:
+            self.log('Свежие кадры WGC восстановлены; продолжаю проверку экрана.')
+        return waiting
+
     def start(self, navigation_only=False):
         if self.active:
             # A duplicate UI event must not reach guard(), which cancels on errors.
@@ -110,6 +189,8 @@ class SiegeRoute:
             raise RuntimeError('Для маршрута выберите всю клиентскую область.')
         ui.cancel()
         self.run_id = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+        self._archived_frames = set()
+        self._video_pause = None
         self.attempts = set()
         self.index = 0
         self.limit = 2 if navigation_only else 5
@@ -151,6 +232,8 @@ class SiegeRoute:
                 ui.stop()
                 return
             now = time.monotonic()
+            if self.wait_for_video():
+                return
             if self.phase not in ('click', 'wake') and win.user32.GetForegroundWindow() != self.hwnd:
                 self.resume_phase = self.phase
                 self.phase = 'wake'

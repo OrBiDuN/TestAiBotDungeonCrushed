@@ -6,6 +6,13 @@ import winmouse as win
 STEAM_EXE = Path(r'C:\Program Files (x86)\Steam\steamapps\common\Dungeon Crusher Soul Hunters\dungeoncrusher.exe')
 
 
+def launch_game():
+    import subprocess
+    if not STEAM_EXE.is_file():
+        raise RuntimeError('Не найден установленный Dungeon Crusher: ' + str(STEAM_EXE))
+    subprocess.Popen([str(STEAM_EXE)], cwd=str(STEAM_EXE.parent))
+
+
 def steam_windows():
     processes = {}
     for proc in psutil.process_iter(['pid', 'name', 'exe']):

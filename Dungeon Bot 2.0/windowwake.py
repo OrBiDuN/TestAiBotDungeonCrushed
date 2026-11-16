@@ -32,6 +32,9 @@ class WindowWake:
         self.stable_since = None
         self.ready_at = None
         if now > self.deadline:
+            from desktop_session import snapshot
+            if snapshot()['state'] == 4:
+                raise RuntimeError('RDP-сеанс отключён. Отправьте /desktop или нажмите «Восстановить рабочий стол», затем /setup. Клик не выполнен.')
             raise RuntimeError(f'Не удалось пробудить HWND {self.hwnd}: активное окно '
                                f'{win.user32.GetForegroundWindow()}. Клик не выполнен.')
         if now < self.next_attempt or self.attempts >= 3:
